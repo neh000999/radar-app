@@ -142,6 +142,7 @@ const app = {
   config: {},            // kv app_config, written by every radar run
   searches: [],          // rows of `searches` with parsed spec
   pending: new Map(),    // "item:12" / "match:5" → action value not yet applied by a run
+  pendingAuthors: new Map(), // handle → track_author / untrack_author / mute_author / unmute_author
   prefs: Object.assign({ feed: {}, people: {} }, store(PREFS_KEY) || {}),
 };
 const savePrefs = () => store(PREFS_KEY, app.prefs);
@@ -151,6 +152,7 @@ const APP_TABLES = [
   `CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, kind TEXT NOT NULL,
      target TEXT, value TEXT, source TEXT DEFAULT 'web', applied_at TEXT, result TEXT)`,
   `CREATE TABLE IF NOT EXISTS search_specs (id TEXT PRIMARY KEY, spec TEXT NOT NULL, deleted INTEGER DEFAULT 0, updated_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS company_specs (id TEXT PRIMARY KEY, spec TEXT NOT NULL, deleted INTEGER DEFAULT 0, updated_at TEXT)`,
 ];
 
 async function loadBasics() {
@@ -167,9 +169,11 @@ async function loadBasics() {
   app.kv = kvm;
   app.searches = searches.map((s) => ({ ...s, spec: json(s.spec, {}) }));
   app.pending = new Map();
+  app.pendingAuthors = new Map();
   for (const a of pending) {
     if (a.kind === "item_feedback") app.pending.set(`item:${a.target}`, a.value);
     if (a.kind === "match_feedback") app.pending.set(`match:${a.target}`, a.value);
+    if (/_author$/.test(a.kind)) app.pendingAuthors.set(a.target, a.kind);
   }
   app.lastRun = lastRun[0] || null;
   renderStatus();
@@ -410,7 +414,7 @@ function readConnectLink() {
 // ── router ───────────────────────────────────────────────────────────────────
 
 const ROUTES = {
-  feed: renderFeed, people: renderPeople, searches: renderSearches, search: renderSearchEdit,
+  feed: renderFeed, people: renderPeople, companies: renderCompanies, searches: renderSearches, search: renderSearchEdit,
   runs: renderRuns, settings: renderSettings, item: renderDetail, match: renderDetail,
 };
 
@@ -680,19 +684,51 @@ async function renderDetail(view, [id], name) {
 
 const PEOPLE_DEFAULTS = { search: "", status: "open", type: "", min: 50 };
 
-async function renderPeople(view) {
+function subTabs(base, tabs, current) {
+  return `<div class="tabs sub">${tabs.map(([k, label]) =>
+    `<a class="tab${k === current ? " on" : ""}" href="#/${base}${k ? `/${k}` : ""}">${esc(label)}</a>`).join("")}</div>`;
+}
+const peopleTabs = (cur) => subTabs("people", [["", "Findings"], ["following", "Following"]], cur);
+const companyTabs = (cur) => subTabs("companies", [["", "Watching"], ["discovered", "Discovered"]], cur);
+const opt = (v, label, cur) => `<option value="${esc(v)}"${String(cur) === String(v) ? " selected" : ""}>${esc(label)}</option>`;
+const profileUrl = (a) => safeUrl(a.url) || `https://www.linkedin.com/in/${encodeURIComponent(a.handle)}`;
+
+function handleFrom(v) {
+  const m = String(v || "").match(/linkedin\.com\/in\/([^/?#]+)/i);
+  return decodeURIComponent(m ? m[1] : String(v || "")).trim().replace(/^@/, "").replace(/\/+$/, "").toLowerCase();
+}
+
+async function followedHandles() {
+  const rows = await app.db.q("SELECT handle FROM authors WHERE tracked = 1 AND muted = 0");
+  const set = new Set(rows.map((r) => r.handle));
+  for (const [h, kind] of app.pendingAuthors) {
+    if (kind === "track_author") set.add(h);
+    if (kind === "untrack_author" || kind === "mute_author") set.delete(h);
+  }
+  return set;
+}
+
+async function renderPeople(view, [sub]) {
+  if (sub === "following") return renderFollowing(view);
+  return renderFindings(view);
+}
+
+async function renderFindings(view) {
   const peopleSearches = app.searches.filter((s) => s.type === "event_attendees");
   if (!peopleSearches.length) {
-    view.innerHTML = `<div class="card empty"><p>No “people to meet” searches yet.</p>
+    view.innerHTML = `${peopleTabs("")}<div class="card empty"><p>No “people to meet” searches yet.</p>
       <p><a class="btn primary" href="#/search/new/event_attendees">Create one</a></p></div>`;
     return;
   }
   const f = Object.assign({}, PEOPLE_DEFAULTS, { search: peopleSearches[0].id }, app.prefs.people);
   if (!peopleSearches.some((s) => s.id === f.search)) f.search = peopleSearches[0].id;
-  const rows = await app.db.q(`SELECT 'match' AS rtype, m.id AS rid, m.search_id, ${ROW_COLS.replace(/(\w+)/g, "i.$1")},
-      m.found_at, m.sources, m.queries, m.stage, m.score, m.triage_score, m.analysis, m.notified_at, m.digest_slot AS digest, m.feedback
-    FROM matches m JOIN items i ON i.id = m.item_id WHERE m.search_id = ? AND m.stage = 'analyzed' ORDER BY m.score DESC`, [f.search]);
-  const waiting = await app.db.q(`SELECT COUNT(*) AS n FROM matches WHERE search_id = ? AND (stage = 'new' OR stage = 'triaged')`, [f.search]);
+  const [rows, waiting] = await app.db.run([
+    [`SELECT 'match' AS rtype, m.id AS rid, m.search_id, ${ROW_COLS.replace(/(\w+)/g, "i.$1")},
+        m.found_at, m.sources, m.queries, m.stage, m.score, m.triage_score, m.analysis, m.notified_at, m.digest_slot AS digest, m.feedback
+      FROM matches m JOIN items i ON i.id = m.item_id WHERE m.search_id = ? AND m.stage = 'analyzed' ORDER BY m.score DESC`, [f.search]],
+    ["SELECT COUNT(*) AS n FROM matches WHERE search_id = ? AND (stage = 'new' OR stage = 'triaged')", [f.search]],
+  ]);
+  const following = await followedHandles();
   const seen = new Set();
   let people = [];
   for (const r of rows) {
@@ -708,8 +744,7 @@ async function renderPeople(view) {
   };
   people = people.filter((p) => (p.score ?? 0) >= f.min && (!f.type || p.a.company_type === f.type)
     && (f.status === "all" || (f.status === "open" ? ["open", "useful"].includes(status(p)) : status(p) === f.status)));
-  const opt = (v, label, cur) => `<option value="${esc(v)}"${String(cur) === String(v) ? " selected" : ""}>${esc(label)}</option>`;
-  view.innerHTML = `
+  view.innerHTML = `${peopleTabs("")}
   <section class="filters card">
     <label>Search<select id="p-search">${peopleSearches.map((s) => opt(s.id, s.name, f.search)).join("")}</select></label>
     <label>Show<select id="p-status">${opt("open", "To contact", f.status)}${opt("contacted", "Reached out", f.status)}${opt("not_relevant", "Not relevant", f.status)}${opt("all", "Everyone", f.status)}</select></label>
@@ -724,22 +759,27 @@ async function renderPeople(view) {
       <td>${badge(p.score)}</td>
       <td><a href="#/match/${p.rid}"><b>${esc(p.a.person || p.author_name || p.a.company || "?")}</b></a>
         ${p.a.poster_type === "company" && p.author_name ? `<div class="muted small">posted by ${esc(p.author_name)}</div>` : ""}</td>
-      <td>${esc([p.a.role, p.a.company].filter(Boolean).join(", "))}<div class="muted small">${esc((p.a.company_type || "").replace(/_/g, " "))}</div></td>
+      <td>${esc([p.a.role, p.a.company && !(p.a.role || "").includes(p.a.company) ? p.a.company : ""].filter(Boolean).join(", "))}<div class="muted small">${esc((p.a.company_type || "").replace(/_/g, " "))}</div></td>
       <td>${esc(attendance(p.a))}</td>
       <td><span class="chip st-${status(p)}">${{ open: "To contact", useful: "Useful", contacted: "Reached out", not_relevant: "Not relevant" }[status(p)]}</span></td>
       <td class="nowrap">${safeUrl(p.url) ? `<a class="btn small" href="${esc(safeUrl(p.url))}" target="_blank" rel="noopener noreferrer">Post ↗</a>` : ""}
-        <button class="fb small" data-kind="match_feedback" data-target="${p.rid}" data-key="match:${p.rid}" data-act="mc">✅</button>
-        <button class="fb small" data-kind="match_feedback" data-target="${p.rid}" data-key="match:${p.rid}" data-act="mn">👎</button></td>
+        <button class="fb small" data-kind="match_feedback" data-target="${p.rid}" data-key="match:${p.rid}" data-act="mc" title="I reached out">✅</button>
+        <button class="fb small" data-kind="match_feedback" data-target="${p.rid}" data-key="match:${p.rid}" data-act="mn" title="Not relevant">👎</button>
+        ${p.author_handle ? (following.has(p.author_handle) ? `<span class="chip st-active">Following</span>`
+          : `<button class="btn small" data-follow="${esc(p.author_handle)}" title="The radar also searches their next posts">Follow</button>`) : ""}</td>
     </tr>`).join("")}</tbody></table></div>
   ${people.length ? "" : `<div class="card empty">No one matches these filters yet.</div>`}`;
   const update = () => {
     app.prefs.people = { search: $("#p-search").value, status: $("#p-status").value, type: $("#p-type").value, min: Number($("#p-min").value) };
     savePrefs();
-    renderPeople(view);
+    renderFindings(view);
   };
   for (const id of ["p-search", "p-status", "p-type", "p-min"]) $(`#${id}`).onchange = update;
   for (const b of $$(".fb", view)) b.onclick = async () => {
-    if (await act(b.dataset.kind, b.dataset.target, b.dataset.act, b.dataset.key)) renderPeople(view);
+    if (await act(b.dataset.kind, b.dataset.target, b.dataset.act, b.dataset.key)) renderFindings(view);
+  };
+  for (const b of $$("[data-follow]", view)) b.onclick = async () => {
+    if (await authorAct("track_author", b.dataset.follow)) b.outerHTML = `<span class="chip st-active">Following</span>`;
   };
   $("#p-csv").onclick = () => downloadCsv(`${f.search}-people.csv`, [
     ["score", "person", "role", "company", "company_type", "attending_as", "stand", "dates", "invites_meetings",
@@ -747,6 +787,246 @@ async function renderPeople(view) {
     ...people.map((p) => [p.score, p.a.person || p.author_name || "", p.a.role, p.a.company, p.a.company_type, p.a.attending_as,
       p.a.stand, p.a.dates, p.a.invites_meetings ? "yes" : "", p.a.why, p.a.comment, p.a.connect_note, p.url, status(p)]),
   ]);
+}
+
+async function authorAct(kind, handle) {
+  const ok = await act(kind, handle, "");
+  if (ok) app.pendingAuthors.set(handle, kind);
+  return ok;
+}
+
+const ORIGIN = {
+  discovered: "Found by the radar (high score)", feedback: "You tapped 👍", commented: "You commented",
+  manual: "Added by you in Telegram", web: "Added by you in the app", config: "In config.yaml",
+};
+
+async function renderFollowing(view) {
+  const [tracked, muted] = await app.db.run([
+    [`SELECT a.handle, a.name, a.url, a.followers, a.origin, a.best_score, a.commented, a.added_at, a.last_post_at,
+        (SELECT COUNT(*) FROM items i WHERE i.author_handle = a.handle) AS posts
+      FROM authors a WHERE a.tracked = 1 AND a.muted = 0 ORDER BY a.best_score DESC, a.followers DESC LIMIT 500`],
+    ["SELECT handle, name, url FROM authors WHERE muted = 1 ORDER BY name LIMIT 500"],
+  ]);
+  const known = new Set(tracked.map((a) => a.handle));
+  for (const p of app.config.people || []) {     // people listed in config.yaml
+    const h = handleFrom(typeof p === "string" ? p : p.handle);
+    if (h && !known.has(h)) { tracked.push({ handle: h, name: p.name || "", origin: "config", posts: 0 }); known.add(h); }
+  }
+  for (const [h, kind] of app.pendingAuthors) {  // added in the app, not applied by a run yet
+    if (kind === "track_author" && !known.has(h)) { tracked.unshift({ handle: h, name: "", origin: "web", posts: 0, pending: true }); known.add(h); }
+  }
+  const state = (h) => app.pendingAuthors.get(h);
+  view.innerHTML = `${peopleTabs("following")}
+  <section class="card">
+    <div class="row-head"><h2>People the radar follows <span class="muted small">(${tracked.length})</span></h2></div>
+    <p class="muted small">The radar searches their new posts on every run and gives them a small score bonus.
+      It follows people automatically when they write high-scoring posts, when you tap 👍 or ✅, or when you add them here.</p>
+    <form class="track-add" id="t-form"><input id="t-in" placeholder="LinkedIn profile link or handle (linkedin.com/in/…)">
+      <button class="btn primary">Follow</button></form>
+  </section>
+  <div class="table-wrap"><table class="following">
+    <thead><tr><th>Person</th><th>Why followed</th><th>Best score</th><th>Posts found</th><th>Last post</th><th>Followers</th><th></th></tr></thead>
+    <tbody>${tracked.map((a) => {
+      const s = state(a.handle);
+      const gone = s === "untrack_author" || s === "mute_author";
+      return `<tr class="${gone ? "muted" : ""}">
+      <td><a href="${esc(profileUrl(a))}" target="_blank" rel="noopener noreferrer"><b>${esc(a.name || a.handle)}</b></a>
+        ${a.commented ? ` <span class="chip st-contacted" title="You commented on their post">✅ commented</span>` : ""}
+        ${a.pending || s === "track_author" ? ` <span class="chip st-paused">applies next run</span>` : ""}
+        <div class="muted small">${esc(a.handle)}</div></td>
+      <td>${esc(ORIGIN[a.origin] || a.origin || "–")}</td>
+      <td>${a.best_score ? badge(a.best_score) : "–"}</td>
+      <td>${num(a.posts)}</td>
+      <td>${esc(ago(a.last_post_at) || "–")}</td>
+      <td>${a.followers ? num(a.followers) : "–"}</td>
+      <td class="nowrap">${a.posts ? `<button class="btn small" data-posts="${esc(a.name || a.handle)}">Posts</button>` : ""}
+        ${gone ? `<span class="muted small">${s === "mute_author" ? "Muting" : "Stopping"}…</span>`
+          : `<button class="btn small" data-untrack="${esc(a.handle)}">Stop following</button>
+             <button class="btn small" data-mute="${esc(a.handle)}" title="Never show their posts again">Mute</button>`}</td></tr>`;
+    }).join("")}</tbody></table></div>
+  ${tracked.length ? "" : `<div class="card empty">Nobody yet. Tap 👍 or ✅ on a post, or add someone above.</div>`}
+  ${muted.length ? `<section class="card"><h2>Muted <span class="muted small">(${muted.length})</span></h2>
+    <p class="muted small">Their posts never show up.</p>
+    <ul class="people-list">${muted.map((a) => `<li><a href="${esc(profileUrl(a))}" target="_blank" rel="noopener noreferrer">${esc(a.name || a.handle)}</a>
+      ${state(a.handle) === "unmute_author" ? `<span class="muted small">unmuting…</span>` : `<button class="link" data-unmute="${esc(a.handle)}">Unmute</button>`}</li>`).join("")}</ul></section>` : ""}`;
+  $("#t-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const h = handleFrom($("#t-in").value);
+    if (!h || /\s/.test(h)) { toast("Paste a LinkedIn profile link like linkedin.com/in/jane-doe.", true); return; }
+    if (await authorAct("track_author", h)) renderFollowing(view);
+  };
+  for (const b of $$("[data-untrack]", view)) b.onclick = async () => { if (await authorAct("untrack_author", b.dataset.untrack)) renderFollowing(view); };
+  for (const b of $$("[data-mute]", view)) b.onclick = async () => {
+    if (confirm("Mute this person? Their posts will never show up again.") && await authorAct("mute_author", b.dataset.mute)) renderFollowing(view);
+  };
+  for (const b of $$("[data-unmute]", view)) b.onclick = async () => { if (await authorAct("unmute_author", b.dataset.unmute)) renderFollowing(view); };
+  for (const b of $$("[data-posts]", view)) b.onclick = () => showInFeed(b.dataset.posts);
+}
+
+function showInFeed(text) {
+  app.prefs.feed = { ...FEED_DEFAULTS, search: "all", status: "all", days: 0, q: text, sort: "new" };
+  savePrefs();
+  location.hash = "#/feed";
+}
+
+// ── companies ────────────────────────────────────────────────────────────────
+
+const companyId = (name) => slug(name);
+const companySlug = (v) => {
+  const m = String(v || "").match(/linkedin\.com\/(?:company|showcase)\/([^/?#]+)/i);
+  return decodeURIComponent(m ? m[1] : String(v || "")).trim().replace(/\/+$/, "").toLowerCase();
+};
+const companyQuery = (c) => `company:"${c.name}" ${c.context || ""}`.trim();
+const likeJson = (s) => `%${JSON.stringify(s).slice(1, -1)}%`;   // how a phrase appears inside items.queries
+
+async function companyList() {
+  // Companies as the last run saw them (config.yaml plus app edits), overlaid with edits not applied yet.
+  const rows = await app.db.q("SELECT id, spec, deleted, updated_at FROM company_specs");
+  const web = new Map(rows.map((r) => [r.id, { ...r, spec: json(r.spec, {}) }]));
+  const list = (app.config.companies || []).map((c) => ({ ...c, id: companyId(c.name) }));
+  const ids = new Set(list.map((c) => c.id));
+  const ranAt = app.lastRun && app.lastRun.started_at;
+  for (const c of list) {
+    const w = web.get(c.id);
+    if (w && (!ranAt || w.updated_at > ranAt)) {
+      c.pending = w.deleted ? "removing" : "changed";
+      if (!w.deleted) Object.assign(c, w.spec);
+    }
+  }
+  for (const w of web.values()) {
+    if (!ids.has(w.id) && !w.deleted) list.push({ ...w.spec, id: w.id, pending: "new" });
+  }
+  return { list, web };
+}
+
+async function saveCompany(c, deleted = false) {
+  const spec = { name: c.name.trim(), context: (c.context || "").trim(), linkedin: companySlug(c.linkedin) };
+  try {
+    await app.db.run([["INSERT OR REPLACE INTO company_specs(id, spec, deleted, updated_at) VALUES(?,?,?,?)",
+                       [companyId(spec.name), JSON.stringify(spec), deleted ? 1 : 0, nowIso()]]]);
+    toast(deleted ? "The radar stops watching it on the next run." : "Saved. The next radar run uses it.");
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+
+async function renderCompanies(view, [sub]) {
+  if (sub === "discovered") return renderDiscovered(view);
+  const { list } = await companyList();
+  const stmts = [];
+  for (const c of list) {
+    stmts.push([`SELECT COUNT(*) AS n, MAX(score) AS best, MAX(discovered_at) AS last,
+                   SUM(CASE WHEN score >= 60 THEN 1 ELSE 0 END) AS good FROM items WHERE queries LIKE ?`, [likeJson(companyQuery(c))]]);
+    stmts.push(["SELECT runs, results, fresh, good, last_run FROM queries WHERE text = ?", [companyQuery(c)]]);
+    stmts.push([`SELECT (SELECT value FROM kv WHERE key = ?) AS page_read,
+                   (SELECT COUNT(*) FROM items WHERE queries LIKE ?) AS page_posts`,
+                 [`company_page:${c.linkedin || "-"}`, `%company-page:${c.linkedin || "-"}"%`]]);
+  }
+  const res = stmts.length ? await app.db.run(stmts) : [];
+  list.forEach((c, i) => {
+    c.posts = res[i * 3][0];
+    c.q = res[i * 3 + 1][0] || {};
+    c.page = res[i * 3 + 2][0] || {};
+  });
+  list.sort((a, b) => (b.posts.good || 0) - (a.posts.good || 0) || (b.posts.n || 0) - (a.posts.n || 0));
+  view.innerHTML = `${companyTabs("")}
+  <section class="card">
+    <h2 id="c-title">Watch a company</h2>
+    <p class="muted small">The radar searches LinkedIn posts that mention the company. Add its LinkedIn page and it also reads
+      the page's own recent posts (and the posts it reposts) about once a day.</p>
+    <form id="c-form" class="cols3 company-form" autocomplete="off">
+      <label>Company name<input name="name" required placeholder="Wizz Air"></label>
+      <label>Extra words <span class="muted">(optional, to avoid mix-ups)</span><input name="context" placeholder="airline"></label>
+      <label>LinkedIn page <span class="muted">(optional)</span><input name="linkedin" placeholder="linkedin.com/company/wizz-air"></label>
+      <div class="foot"><button class="primary">Save</button><button type="button" class="btn" id="c-cancel" hidden>Cancel</button></div>
+    </form>
+  </section>
+  <div class="table-wrap"><table class="companies">
+    <thead><tr><th>Company</th><th>Posts found</th><th>Scored 60+</th><th>Best</th><th>Last post found</th><th>LinkedIn page</th><th></th></tr></thead>
+    <tbody>${list.map((c) => `<tr class="${c.pending === "removing" ? "muted" : ""}">
+      <td><b>${esc(c.name)}</b>${c.context ? ` <span class="muted small">+ “${esc(c.context)}”</span>` : ""}
+        ${c.pending ? ` <span class="chip st-paused">${{ new: "new · starts next run", changed: "changed · applies next run", removing: "stops next run" }[c.pending]}</span>` : ""}
+        ${c.q.runs ? `<div class="muted small">searched ${num(c.q.runs)} times · last ${esc(ago(c.q.last_run))}</div>` : ""}</td>
+      <td>${num((c.posts.n || 0) + (c.page.page_posts || 0))}</td>
+      <td>${num(c.posts.good || 0)}</td>
+      <td>${c.posts.best != null ? badge(c.posts.best) : "–"}</td>
+      <td>${esc(ago(c.posts.last) || "–")}</td>
+      <td>${c.linkedin ? `<a href="https://www.linkedin.com/company/${esc(encodeURIComponent(c.linkedin))}/" target="_blank" rel="noopener noreferrer">${esc(c.linkedin)}</a>
+          <div class="muted small">${c.page.page_read ? `read ${esc(ago(json(c.page.page_read, c.page.page_read)))}` : "not read yet"}</div>`
+        : `<span class="muted small">not set</span>`}</td>
+      <td class="nowrap">${c.posts.n ? `<button class="btn small" data-posts="${esc(c.name)}">Posts</button>` : ""}
+        ${c.pending === "removing" ? "" : `<button class="btn small" data-edit="${esc(c.id)}">Edit</button>
+        <button class="btn small" data-remove="${esc(c.id)}">Stop watching</button>`}</td></tr>`).join("")}</tbody></table></div>
+  ${list.length ? "" : `<div class="card empty">No companies yet. Add one above, or watch one from Discovered.</div>`}`;
+  const form = $("#c-form");
+  const byId = new Map(list.map((c) => [c.id, c]));
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const c = { name: form.elements.name.value, context: form.elements.context.value, linkedin: form.elements.linkedin.value };
+    if (!c.name.trim()) { toast("Enter the company name.", true); return; }
+    const was = form.dataset.editing;
+    if (was && was !== companyId(c.name)) await saveCompany(byId.get(was), true);   // renamed: retire the old entry
+    if (await saveCompany(c)) renderCompanies(view, []);
+  };
+  for (const b of $$("[data-edit]", view)) b.onclick = () => {
+    const c = byId.get(b.dataset.edit);
+    form.dataset.editing = c.id;
+    form.elements.name.value = c.name;
+    form.elements.context.value = c.context || "";
+    form.elements.linkedin.value = c.linkedin || "";
+    $("#c-title").textContent = `Edit ${c.name}`;
+    $("#c-cancel").hidden = false;
+    form.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+  $("#c-cancel").onclick = () => renderCompanies(view, []);
+  for (const b of $$("[data-remove]", view)) b.onclick = async () => {
+    const c = byId.get(b.dataset.remove);
+    if (confirm(`Stop watching ${c.name}? Posts already found stay.`) && await saveCompany(c, true)) renderCompanies(view, []);
+  };
+  for (const b of $$("[data-posts]", view)) b.onclick = () => showInFeed(b.dataset.posts);
+}
+
+async function renderDiscovered(view) {
+  const [rows] = await app.db.run([[`SELECT m.id AS rid, m.search_id, m.score, m.analysis, i.author_name, i.author_handle, i.url
+    FROM matches m JOIN items i ON i.id = m.item_id WHERE m.stage = 'analyzed' AND m.analysis LIKE '%"company"%'`]]);
+  const { list } = await companyList();
+  const watched = new Set(list.map((c) => c.name.toLowerCase()));
+  const groups = new Map();
+  for (const r of rows) {
+    const a = json(r.analysis, {}) || {};
+    const name = (a.company || "").trim();
+    if (!name || name.length < 2) continue;
+    const key = name.toLowerCase();
+    const g = groups.get(key) || { name, type: a.company_type, best: 0, people: [], searches: new Set(), stands: new Set() };
+    g.best = Math.max(g.best, r.score || 0);
+    g.people.push({ name: a.person || r.author_name || "", rid: r.rid, score: r.score || 0 });
+    g.searches.add(r.search_id);
+    if (a.stand) g.stands.add(a.stand);
+    if (!g.type || g.type === "other") g.type = a.company_type;
+    groups.set(key, g);
+  }
+  const found = [...groups.values()].sort((a, b) => b.best - a.best || b.people.length - a.people.length);
+  const fresh = found.filter((g) => !watched.has(g.name.toLowerCase()));
+  view.innerHTML = `${companyTabs("discovered")}
+  <section class="card"><h2>Companies the radar discovered <span class="muted small">(${fresh.length} not watched yet)</span></h2>
+    <p class="muted small">Companies named in your people findings (for example, everyone going to WTM London), best first.
+      Watch one and the radar starts searching posts about it too.</p></section>
+  <div class="table-wrap"><table class="companies">
+    <thead><tr><th>Company</th><th>Type</th><th>Best</th><th>People found</th><th>Found by</th><th></th></tr></thead>
+    <tbody>${found.map((g) => {
+      const w = watched.has(g.name.toLowerCase());
+      return `<tr>
+      <td><b>${esc(g.name)}</b>${g.stands.size ? `<div class="muted small">stand ${esc([...g.stands].join(", "))}</div>` : ""}</td>
+      <td>${esc((g.type || "").replace(/_/g, " "))}</td>
+      <td>${badge(g.best)}</td>
+      <td>${g.people.sort((a, b) => b.score - a.score).slice(0, 3).map((p) => `<a href="#/match/${p.rid}">${esc(p.name || "post")}</a>`).join(", ")}
+        ${g.people.length > 3 ? `<span class="muted small"> +${g.people.length - 3}</span>` : ""}</td>
+      <td class="muted small">${esc([...g.searches].map(searchName).join(", "))}</td>
+      <td class="nowrap">${w ? `<span class="chip st-active">Watching</span>` : `<button class="btn small primary" data-watch="${esc(g.name)}">Watch</button>`}</td></tr>`;
+    }).join("")}</tbody></table></div>
+  ${found.length ? "" : `<div class="card empty">Nothing yet. Companies appear here as people searches find attendees.</div>`}`;
+  for (const b of $$("[data-watch]", view)) b.onclick = async () => {
+    if (await saveCompany({ name: b.dataset.watch, context: "", linkedin: "" })) b.outerHTML = `<span class="chip st-paused">Watching from next run</span>`;
+  };
 }
 
 function downloadCsv(name, rows) {
@@ -1117,10 +1397,6 @@ async function runNow(mode = "force-collect") {
 // ── settings ─────────────────────────────────────────────────────────────────
 
 async function renderSettings(view) {
-  const [tracked, muted] = await app.db.run([
-    ["SELECT handle, name, url, origin, best_score, commented FROM authors WHERE tracked = 1 AND muted = 0 ORDER BY best_score DESC LIMIT 200"],
-    ["SELECT handle, name FROM authors WHERE muted = 1 ORDER BY name LIMIT 200"],
-  ]);
   const cfg = app.config;
   const p = cfg.profile || {};
   const gh = (app.conn && app.conn.gh) || {};
@@ -1148,16 +1424,9 @@ async function renderSettings(view) {
       <ul class="plain">${(p.facts || []).map((f) => `<li>${esc(f)}</li>`).join("") || "<li class=muted>No facts yet.</li>"}</ul>
       <p class="muted small">Edit these, the topics and the comment style in <code>config.yaml</code>.</p></div>
   </section>
-  <section class="card"><h2>People the radar follows <span class="muted small">(${tracked.length})</span></h2>
-    <div class="track-add"><input id="track-in" placeholder="LinkedIn profile link or handle"><button class="btn" id="track-go">Follow</button></div>
-    <ul class="people-list">${tracked.map((a) => `<li><a href="${esc(safeUrl(a.url) || `https://www.linkedin.com/in/${a.handle}`)}" target="_blank" rel="noopener noreferrer">${esc(a.name || a.handle)}</a>
-      <span class="muted small">${esc(a.origin || "")}${a.commented ? " · you commented" : ""}</span>
-      <button class="link" data-untrack="${esc(a.handle)}">Stop following</button></li>`).join("")}</ul>
-    ${muted.length ? `<h2>Muted</h2><ul class="people-list">${muted.map((a) => `<li>${esc(a.name || a.handle)}
-      <button class="link" data-unmute="${esc(a.handle)}">Unmute</button></li>`).join("")}</ul>` : ""}
-  </section>
-  <section class="card"><h2>Companies watched</h2>
-    <p>${(cfg.companies || []).map((c) => esc(c.name)).join(" · ") || "–"}</p></section>`;
+  <section class="card"><h2>People and companies</h2>
+    <p>Who the radar follows is under <a href="#/people/following">People → Following</a>, and the companies it watches
+      are under <a href="#/companies">Companies</a>.</p></section>`;
   $("#lock2").onclick = lockNow;
   $("#signout").onclick = () => {
     if (!confirm("Remove the radar connection and keys from this browser?")) return;
@@ -1170,15 +1439,6 @@ async function renderSettings(view) {
     if (await saveConn(conn)) toast("Saved, encrypted with your password.");
     else toast("Saved for this visit. To keep it, lock the app, unlock with your password and save again.", true);
   };
-  $("#track-go").onclick = async () => {
-    const v = $("#track-in").value.trim();
-    const m = v.match(/linkedin\.com\/in\/([^/?#]+)/i);
-    const handle = (m ? m[1] : v).replace(/^@/, "").toLowerCase();
-    if (!handle) return;
-    if (await act("track_author", handle, "")) $("#track-in").value = "";
-  };
-  for (const b of $$("[data-untrack]", view)) b.onclick = async () => { if (await act("untrack_author", b.dataset.untrack, "")) b.closest("li").classList.add("muted"); };
-  for (const b of $$("[data-unmute]", view)) b.onclick = async () => { if (await act("unmute_author", b.dataset.unmute, "")) b.closest("li").classList.add("muted"); };
 }
 
 // ── start ────────────────────────────────────────────────────────────────────

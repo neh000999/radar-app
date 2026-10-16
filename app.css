@@ -118,6 +118,10 @@ legend { font-size: 13px; font-weight: 600; padding: 0 4px; }
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
 .tab { padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); text-decoration: none; color: var(--muted); font-size: 14px; }
 .tab.on { background: var(--accent-weak); color: var(--accent); border-color: var(--accent); }
+.tabs.sub { margin: 0 0 12px; }
+.company-form { align-items: end; }
+.company-form .foot { grid-column: 1 / -1; margin-top: 0; }
+table.following td, table.companies td { vertical-align: middle; }
 .cols3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .budget { background: var(--surface-2); border-radius: 8px; padding: 8px 12px; font-size: 13px; }
 .budget.tight { background: var(--ok-bg); }
