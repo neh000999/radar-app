@@ -153,6 +153,7 @@ const APP_TABLES = [
      target TEXT, value TEXT, source TEXT DEFAULT 'web', applied_at TEXT, result TEXT)`,
   `CREATE TABLE IF NOT EXISTS search_specs (id TEXT PRIMARY KEY, spec TEXT NOT NULL, deleted INTEGER DEFAULT 0, updated_at TEXT)`,
   `CREATE TABLE IF NOT EXISTS company_specs (id TEXT PRIMARY KEY, spec TEXT NOT NULL, deleted INTEGER DEFAULT 0, updated_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS config_overrides (id TEXT PRIMARY KEY, spec TEXT NOT NULL, deleted INTEGER DEFAULT 0, updated_at TEXT)`,
 ];
 
 async function loadBasics() {
@@ -414,7 +415,7 @@ function readConnectLink() {
 // ── router ───────────────────────────────────────────────────────────────────
 
 const ROUTES = {
-  feed: renderFeed, people: renderPeople, companies: renderCompanies, searches: renderSearches, search: renderSearchEdit,
+  feed: renderFeed, people: renderPeople, companies: renderCompanies, searches: renderSearches, search: renderSearchEdit, builtin: renderBuiltin,
   runs: renderRuns, settings: renderSettings, item: renderDetail, match: renderDetail,
 };
 
@@ -422,7 +423,8 @@ async function route() {
   if (!app.db) return;
   const [, name = "feed", ...rest] = location.hash.replace(/^#/, "").split("/");
   const fn = ROUTES[name] || renderFeed;
-  for (const a of $$("#nav a")) a.classList.toggle("on", a.dataset.route === (name === "search" ? "searches" : name));
+  const tab = { search: "searches", builtin: "searches", item: "feed", match: "feed" }[name] || name;
+  for (const a of $$("#nav a")) a.classList.toggle("on", a.dataset.route === tab);
   const view = $("#view");
   if (route.last !== location.hash) window.scrollTo(0, 0);
   route.last = location.hash;
@@ -1103,13 +1105,16 @@ async function renderSearches(view) {
        <p class="muted">Saved in the app. The next radar run starts it.</p>
        <a class="btn" href="#/search/${encodeURIComponent(w.id)}">Edit</a></div>`).join("")}
     ${cards}
-    <div class="card"><h2>Built in</h2><p class="muted">The hot-topics radar (aviation and travel tech) and the
-      industry news brief also run on every digest. Their topics and phrases live in <code>config.yaml</code>.</p></div>`;
+    ${await builtinCards()}`;
   for (const b of $$("[data-toggle]", view)) b.onclick = async () => {
     const s = app.searches.find((x) => x.id === b.dataset.toggle);
     const spec = { ...effectiveSpec(s, web) };
     spec.enabled = spec.enabled === false;
     if (await saveSpec(spec)) renderSearches(view);
+  };
+  for (const a of $$("[data-show-builtin]", view)) a.onclick = () => {
+    app.prefs.feed = { ...FEED_DEFAULTS, ...app.prefs.feed, search: a.dataset.showBuiltin, status: "all" };
+    savePrefs();
   };
   for (const a of $$("[data-show]", view)) a.onclick = () => {
     app.prefs.feed = { ...FEED_DEFAULTS, ...app.prefs.feed, search: a.dataset.show, status: "all", days: 0 };
@@ -1286,6 +1291,236 @@ async function renderSearchEdit(view, [id, template]) {
   if ($("#del")) $("#del").onclick = async () => {
     if (!confirm(`Delete “${spec.name}”? Its results stay; it just stops searching.`)) return;
     if (await saveSpec(spec, true)) location.hash = "#/searches";
+  };
+}
+
+// ── built-in searches (hot topics and industry news) ─────────────────────────
+
+const HOT_KEYS = ["topics", "linkedin_queries", "exclude_patterns", "scoring.urgent", "scoring.digest"];
+const NEWS_KEYS = ["news.enabled", "news.google_news_queries", "news.bing_news_queries", "news.feeds"];
+
+async function builtinState() {
+  const b = app.config.builtin;
+  if (!b) return null;
+  const sc = app.config.scoring || {};
+  const cur = {
+    topics: b.topics, linkedin_queries: b.linkedin_queries, exclude_patterns: b.exclude_patterns,
+    "news.enabled": b.news.enabled, "news.google_news_queries": b.news.google_news_queries,
+    "news.bing_news_queries": b.news.bing_news_queries, "news.feeds": b.news.feeds,
+    "scoring.urgent": sc.urgent ?? 80, "scoring.digest": sc.digest ?? 60,
+  };
+  const rows = await app.db.q("SELECT id, spec, deleted, updated_at FROM config_overrides");
+  const ranAt = app.lastRun && app.lastRun.started_at;
+  const pending = new Map();          // key → "changed" | "reset", saved here but not applied by a run yet
+  const changed = new Set(app.config.overrides || []);
+  for (const r of rows) {
+    if (ranAt && r.updated_at <= ranAt) continue;
+    if (r.deleted) { pending.set(r.id, "reset"); continue; }
+    cur[r.id] = json(r.spec, cur[r.id]);
+    pending.set(r.id, "changed");
+    changed.add(r.id);
+  }
+  return { cur: JSON.parse(JSON.stringify(cur)), pending, changed };
+}
+
+async function saveOverrides(values, reset = false) {
+  const keys = Object.keys(values);
+  if (!keys.length) { toast("Nothing changed."); return false; }
+  try {
+    await app.db.run(keys.map((k) => ["INSERT OR REPLACE INTO config_overrides(id, spec, deleted, updated_at) VALUES(?,?,?,?)",
+                                      [k, JSON.stringify(values[k]), reset ? 1 : 0, nowIso()]]));
+    toast(reset ? "Back to the defaults from the next run." : "Saved. The next radar run uses it.");
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+
+function changedOnly(next, cur) {
+  const out = {};
+  for (const [k, v] of Object.entries(next)) if (JSON.stringify(v) !== JSON.stringify(cur[k])) out[k] = v;
+  return out;
+}
+
+const commas = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
+
+async function builtinCards() {
+  const week = sinceDays(7);
+  const [hot, news, active] = await app.db.run([
+    [`SELECT COUNT(*) AS n, SUM(CASE WHEN stage = 'analyzed' THEN 1 ELSE 0 END) AS analyzed,
+             SUM(CASE WHEN score >= 60 THEN 1 ELSE 0 END) AS good
+      FROM items WHERE kind <> 'news' AND stage <> 'search' AND discovered_at >= ?`, [week]],
+    [`SELECT COUNT(*) AS n, SUM(CASE WHEN stage = 'analyzed' THEN 1 ELSE 0 END) AS briefed
+      FROM items WHERE kind = 'news' AND discovered_at >= ?`, [week]],
+    ["SELECT kind, COUNT(*) AS n FROM queries WHERE active = 1 GROUP BY kind"],
+  ]);
+  const st = await builtinState();
+  const k = Object.fromEntries(active.map((r) => [r.kind, r.n]));
+  const tag = (keys) => st && keys.some((x) => st.pending.has(x)) ? `<span class="chip st-paused">changes apply next run</span>`
+    : st && keys.some((x) => st.changed.has(x)) ? `<span class="chip st-open">changed in the app</span>` : "";
+  const h = hot[0], n = news[0];
+  return `<h2 class="section">Built in</h2>
+  <article class="card search"><div class="item-head"><span class="chip st-active">Active</span><h2>Hot topics on LinkedIn</h2>${tag(HOT_KEYS)}</div>
+    <p class="muted">Popular aviation and travel-tech posts worth commenting on · searched on every digest ·
+      ${num(k.topic || 0)} phrases, ${num(k.company || 0)} companies, ${num(k.author || 0)} people, ${num(k.auto || 0)} AI-added phrases</p>
+    <div class="stats"><div><b>${num(h.n)}</b><span>posts found (7 days)</span></div><div><b>${num(h.analyzed)}</b><span>analyzed</span></div>
+      <div><b>${num(h.good)}</b><span>scored 60+</span></div><div><b>${st ? st.cur.topics.length : "–"}</b><span>topics</span></div>
+      <div><b>${st ? st.cur["scoring.urgent"] : "–"}</b><span>instant alert from</span></div></div>
+    <div class="foot"><a class="btn" href="#/builtin/hot">Edit</a><a class="btn" href="#/feed" data-show-builtin="hot">See results</a></div></article>
+  <article class="card search"><div class="item-head"><span class="chip st-${st && st.cur["news.enabled"] === false ? "paused" : "active"}">${st && st.cur["news.enabled"] === false ? "Paused" : "Active"}</span><h2>Industry news</h2>${tag(NEWS_KEYS)}</div>
+    <p class="muted">News with a “so what for TKTZ” line and post ideas in each digest ·
+      ${st ? `${num(st.cur["news.google_news_queries"].length + st.cur["news.bing_news_queries"].length)} news searches, ${num(st.cur["news.feeds"].length)} feeds` : ""}</p>
+    <div class="stats"><div><b>${num(n.n)}</b><span>news items (7 days)</span></div><div><b>${num(n.briefed)}</b><span>briefed</span></div></div>
+    <div class="foot"><a class="btn" href="#/builtin/news">Edit</a><a class="btn" href="#/feed" data-show-builtin="news">See results</a></div></article>`;
+}
+
+async function renderBuiltin(view, [which]) {
+  const st = await builtinState();
+  if (!st) {
+    view.innerHTML = `<p><a href="#/searches" class="link">← Searches</a></p><div class="card empty">
+      The editor appears after the next radar run (it sends the current settings to the app).</div>`;
+    return;
+  }
+  return which === "news" ? renderNewsEdit(view, st) : renderHotEdit(view, st);
+}
+
+function pendingNote(st, keys) {
+  const p = keys.filter((k) => st.pending.has(k));
+  if (!p.length) return "";
+  return `<p class="warn">${p.some((k) => st.pending.get(k) === "reset") ? "Going back to the defaults" : "Your changes are saved"};
+    the next radar run applies them.</p>`;
+}
+
+async function renderHotEdit(view, st) {
+  const c = st.cur;
+  const [topicQs, autoQs] = await app.db.run([
+    ["SELECT text, runs, results, fresh, good, last_run FROM queries WHERE kind = 'topic'"],
+    ["SELECT text, active, runs, results, fresh, good, last_run FROM queries WHERE kind = 'auto' ORDER BY active DESC, good DESC, fresh DESC"],
+  ]);
+  const qstat = new Map(topicQs.map((q) => [q.text, q]));
+  const topicRow = (t, i) => `<div class="topic-row" data-i="${i}">
+    <input class="t-name" value="${esc(t.name)}" placeholder="Topic, e.g. Airline distribution">
+    <textarea class="t-kw" rows="2" placeholder="Keywords, comma-separated">${esc((t.keywords || []).join(", "))}</textarea>
+    <span class="nowrap"><button type="button" class="btn small" data-up title="Move up">↑</button><button type="button" class="btn small" data-down title="Move down">↓</button>
+    <button type="button" class="btn small danger" data-del title="Remove">✕</button></span></div>`;
+  view.innerHTML = `<p><a href="#/searches" class="link">← Searches</a></p>
+  <form class="card form" id="hot" autocomplete="off">
+    <h1>Hot topics on LinkedIn</h1>
+    ${pendingNote(st, HOT_KEYS)}
+    <fieldset><legend>Topics, most important first</legend>
+      <p class="muted small">The AI scores every post against these, and broad news feeds keep only items that mention a keyword.</p>
+      <div id="topics">${c.topics.map(topicRow).join("")}</div>
+      <button type="button" class="btn" id="add-topic">+ Add topic</button></fieldset>
+    <label>Search phrases, one per line <span class="muted">("quotes" = exact phrase; the radar adds site:linkedin.com/posts)</span>
+      <textarea name="queries" rows="12">${esc(c.linkedin_queries.join("\n"))}</textarea></label>
+    <details><summary>How each phrase performs</summary>
+      <table class="mini"><thead><tr><th>Phrase</th><th>Runs</th><th>Results</th><th>New</th><th>Useful</th><th>Last</th></tr></thead><tbody>
+      ${c.linkedin_queries.map((q) => { const s = qstat.get(q) || {}; return `<tr><td>${esc(q)}</td><td>${num(s.runs || 0)}</td><td>${num(s.results || 0)}</td>
+        <td>${num(s.fresh || 0)}</td><td>${num(s.good || 0)}</td><td>${esc(ago(s.last_run) || "–")}</td></tr>`; }).join("")}</tbody></table></details>
+    <fieldset><legend>Phrases the AI added</legend>
+      <p class="muted small">Once a week the AI proposes new phrases from posts you liked. Switch off the ones you don't want.</p>
+      ${autoQs.length ? `<table class="mini"><thead><tr><th>On</th><th>Phrase</th><th>Runs</th><th>New</th><th>Useful</th></tr></thead><tbody>
+        ${autoQs.map((q) => `<tr class="${q.active ? "" : "muted"}"><td><input type="checkbox" data-auto="${esc(q.text)}"${q.active ? " checked" : ""}></td>
+          <td>${esc(q.text)}</td><td>${num(q.runs)}</td><td>${num(q.fresh)}</td><td>${num(q.good)}</td></tr>`).join("")}</tbody></table>`
+        : `<p class="muted small">None yet.</p>`}</fieldset>
+    <label>Skip posts that contain any of these, one per line
+      <textarea name="exclude" rows="5">${esc(c.exclude_patterns.join("\n"))}</textarea></label>
+    <fieldset><legend>Scores</legend><div class="cols3">
+      <label>Instant Telegram alert from<input type="number" name="urgent" min="30" max="100" value="${esc(c["scoring.urgent"])}"></label>
+      <label>In the digest from<input type="number" name="digest" min="30" max="100" value="${esc(c["scoring.digest"])}"></label></div></fieldset>
+    <div class="foot"><button class="primary" type="submit">Save</button>
+      <button type="button" class="btn" id="reset">Reset to default</button></div>
+  </form>`;
+  const box = $("#topics");
+  const readTopics = () => $$(".topic-row", box).map((r) => ({ name: $(".t-name", r).value.trim(), keywords: commas($(".t-kw", r).value) }))
+    .filter((t) => t.name);
+  const redraw = (list) => { box.innerHTML = list.map(topicRow).join(""); wire(); };
+  const wire = () => {
+    for (const r of $$(".topic-row", box)) {
+      const i = Number(r.dataset.i);
+      $("[data-up]", r).onclick = () => { const l = readTopics(); if (i > 0) [l[i - 1], l[i]] = [l[i], l[i - 1]]; redraw(l); };
+      $("[data-down]", r).onclick = () => { const l = readTopics(); if (i < l.length - 1) [l[i + 1], l[i]] = [l[i], l[i + 1]]; redraw(l); };
+      $("[data-del]", r).onclick = () => { const l = readTopics(); l.splice(i, 1); redraw(l); };
+    }
+  };
+  wire();
+  $("#add-topic").onclick = () => { const l = readTopics(); l.push({ name: "", keywords: [] }); redraw(l);
+    const rows = $$(".topic-row", box); $(".t-name", rows[rows.length - 1]).focus(); };
+  for (const cb of $$("[data-auto]", view)) cb.onchange = async () => {
+    if (await act("query_active", cb.dataset.auto, cb.checked ? "1" : "0")) cb.closest("tr").classList.toggle("muted", !cb.checked);
+  };
+  const form = $("#hot");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const urgent = Number(form.elements.urgent.value), digest = Number(form.elements.digest.value);
+    const topics = readTopics();
+    if (!topics.length) { toast("Keep at least one topic.", true); return; }
+    if (!(urgent >= 30 && urgent <= 100 && digest >= 30 && digest <= 100)) { toast("Scores go from 30 to 100.", true); return; }
+    if (urgent < digest) { toast("The instant-alert score can't be lower than the digest score.", true); return; }
+    const next = { topics, linkedin_queries: lines(form.elements.queries.value), exclude_patterns: lines(form.elements.exclude.value),
+                   "scoring.urgent": urgent, "scoring.digest": digest };
+    if (!next.linkedin_queries.length) { toast("Keep at least one search phrase.", true); return; }
+    if (await saveOverrides(changedOnly(next, c))) { await loadBasics(); location.hash = "#/searches"; }
+  };
+  $("#reset").onclick = async () => {
+    if (!confirm("Go back to the default topics, phrases and scores from config.yaml?")) return;
+    if (await saveOverrides(Object.fromEntries(HOT_KEYS.map((k) => [k, null])), true)) location.hash = "#/searches";
+  };
+}
+
+async function renderNewsEdit(view, st) {
+  const c = st.cur;
+  const week = sinceDays(7);
+  const names = [...c["news.google_news_queries"].map((q) => `Google News: ${q}`), ...c["news.bing_news_queries"].map((q) => `Bing News: ${q}`),
+                 ...c["news.feeds"].map((f) => f.name)];
+  const counts = names.length ? await app.db.run(names.map((n) => [
+    "SELECT COUNT(*) AS n, SUM(CASE WHEN stage = 'analyzed' THEN 1 ELSE 0 END) AS briefed FROM items WHERE kind = 'news' AND discovered_at >= ? AND queries LIKE ?",
+    [week, likeJson(`feed:${n}`)]])) : [];
+  const stat = new Map(names.map((n, i) => [n, counts[i][0]]));
+  const statLine = (n) => { const s = stat.get(n) || {}; return `<span class="muted small">${num(s.n || 0)} items / 7 days${s.briefed ? ` · ${num(s.briefed)} in digests` : ""}</span>`; };
+  const feedRow = (f, i) => `<div class="feed-row" data-i="${i}">
+    <input class="f-name" value="${esc(f.name)}" placeholder="Name, e.g. Skift">
+    <input class="f-url" value="${esc(f.url)}" placeholder="https://…/feed/">
+    <label class="check"><input type="checkbox" class="f-filter"${f.filter ? " checked" : ""}> only on-topic items</label>
+    <button type="button" class="btn small danger" data-del title="Remove">✕</button>
+    ${f.name && stat.has(f.name) ? statLine(f.name) : ""}</div>`;
+  const qList = (key, label) => `<label>${label}, one per line<textarea name="${key}" rows="6">${esc(c[key].join("\n"))}</textarea></label>
+    <details><summary>What each one brought</summary><ul class="plain">${c[key].map((q) =>
+      `<li>${esc(q)} ${statLine(`${key === "news.google_news_queries" ? "Google" : "Bing"} News: ${q}`)}</li>`).join("")}</ul></details>`;
+  view.innerHTML = `<p><a href="#/searches" class="link">← Searches</a></p>
+  <form class="card form" id="news" autocomplete="off">
+    <h1>Industry news</h1>
+    ${pendingNote(st, NEWS_KEYS)}
+    <label class="check"><input type="checkbox" name="enabled"${c["news.enabled"] === false ? "" : " checked"}> Include industry news in the digests</label>
+    ${qList("news.google_news_queries", "Google News searches")}
+    ${qList("news.bing_news_queries", "Bing News searches")}
+    <fieldset><legend>RSS feeds</legend>
+      <p class="muted small">“Only on-topic items” keeps just the stories that mention one of your hot-topic keywords; use it for broad feeds.</p>
+      <div id="feeds">${c["news.feeds"].map(feedRow).join("")}</div>
+      <button type="button" class="btn" id="add-feed">+ Add feed</button></fieldset>
+    <div class="foot"><button class="primary" type="submit">Save</button>
+      <button type="button" class="btn" id="reset">Reset to default</button></div>
+  </form>`;
+  const box = $("#feeds");
+  const readFeeds = () => $$(".feed-row", box).map((r) => ({ name: $(".f-name", r).value.trim(), url: $(".f-url", r).value.trim(),
+                                                              filter: $(".f-filter", r).checked }));
+  const wire = () => { for (const r of $$(".feed-row", box)) $("[data-del]", r).onclick = () => {
+    const l = readFeeds(); l.splice(Number(r.dataset.i), 1); box.innerHTML = l.map(feedRow).join(""); wire(); }; };
+  wire();
+  $("#add-feed").onclick = () => { const l = readFeeds(); l.push({ name: "", url: "", filter: true });
+    box.innerHTML = l.map(feedRow).join(""); wire(); const rows = $$(".feed-row", box); $(".f-name", rows[rows.length - 1]).focus(); };
+  const form = $("#news");
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const feeds = readFeeds().filter((f) => f.name || f.url);
+    const bad = feeds.find((f) => !f.name || !/^https?:\/\/[^\s/]+\.[^\s]+$/.test(f.url));
+    if (bad) { toast(`Check the feed “${bad.name || bad.url}”: it needs a name and a full https:// address.`, true); return; }
+    const next = { "news.enabled": form.elements.enabled.checked,
+                   "news.google_news_queries": lines(form.elements["news.google_news_queries"].value),
+                   "news.bing_news_queries": lines(form.elements["news.bing_news_queries"].value), "news.feeds": feeds };
+    if (await saveOverrides(changedOnly(next, c))) { await loadBasics(); location.hash = "#/searches"; }
+  };
+  $("#reset").onclick = async () => {
+    if (!confirm("Go back to the default news searches and feeds from config.yaml?")) return;
+    if (await saveOverrides(Object.fromEntries(NEWS_KEYS.map((k) => [k, null])), true)) location.hash = "#/searches";
   };
 }
 

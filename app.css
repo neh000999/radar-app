@@ -188,3 +188,13 @@ details summary { cursor: pointer; color: var(--accent); font-size: 14px; margin
 }
 
 [hidden] { display: none !important; }
+
+.section { margin: 22px 2px 10px; }
+.topic-row, .feed-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+.topic-row textarea { min-height: 38px; font-size: 14px; }
+.feed-row { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto auto; }
+.feed-row > .muted { grid-column: 1 / -1; margin-top: -4px; }
+.feed-row .check { margin: 0; }
+@media (max-width: 720px) {
+  .topic-row, .feed-row { grid-template-columns: minmax(0, 1fr); padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+}
