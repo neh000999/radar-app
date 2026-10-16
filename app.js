@@ -7,8 +7,10 @@
  */
 "use strict";
 
-const CONN_KEY = "radar.connection.v1";
-const GH_KEY = "radar.github.v1";
+const VAULT_KEY = "radar.vault.v1";          // encrypted {url, token, gh}
+const SESSION_KEY = "radar.session.v1";      // unlocked session (see the password lock section)
+const LEGACY_CONN_KEY = "radar.connection.v1"; // first version stored the key unencrypted
+const LEGACY_GH_KEY = "radar.github.v1";
 const PREFS_KEY = "radar.prefs.v1";
 const PAGE = 30;
 
@@ -202,46 +204,196 @@ async function act(kind, target, value, key) {
   } catch (e) { toast(e.message, true); return false; }
 }
 
-// ── connect screen ───────────────────────────────────────────────────────────
+// ── password lock ────────────────────────────────────────────────────────────
+// The database key (and the optional GitHub key) are stored only encrypted: AES-GCM with a key derived from
+// the user's password (PBKDF2-SHA256, 600,000 rounds). Nothing secret is ever part of the published page.
+// An unlocked session lives in sessionStorage (this tab, 12 hours) or, if asked, localStorage (7 days).
 
-function renderConnect(error = "") {
+const PBKDF2_ROUNDS = 600000;
+const enc = new TextEncoder();
+const b64e = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const b64d = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function deriveKey(password, salt) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: PBKDF2_ROUNDS, hash: "SHA-256" }, base,
+                                 { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+}
+
+async function sealVault(conn, key, salt) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify(conn)));
+  store(VAULT_KEY, { v: 1, salt: b64e(salt), iv: b64e(iv), ct: b64e(ct), rounds: PBKDF2_ROUNDS });
+}
+
+async function lockWithPassword(conn, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  app.key = await deriveKey(password, salt);
+  app.salt = salt;
+  await sealVault(conn, app.key, salt);
+}
+
+async function openVault(password) {
+  const v = store(VAULT_KEY);
+  const salt = b64d(v.salt);
+  const key = await deriveKey(password, salt);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64d(v.iv) }, key, b64d(v.ct)); // throws if wrong
+  app.key = key;
+  app.salt = salt;
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+async function saveConn(conn) {
+  // Re-encrypt after a change (e.g. the GitHub key). Needs the key from this visit's unlock.
+  app.conn = conn;
+  if (app.key) await sealVault(conn, app.key, app.salt);
+  rememberSession(conn, !!store(SESSION_KEY));
+  return !!app.key;
+}
+
+function getSession() {
+  let s = null;
+  try { s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null"); } catch { /* blocked storage */ }
+  s = s || store(SESSION_KEY);
+  return s && s.until > Date.now() && s.conn ? s.conn : null;
+}
+
+function rememberSession(conn, longTerm) {
+  const s = { conn, until: Date.now() + (longTerm ? 7 * 864e5 : 12 * 3.6e6) };
+  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(s)); } catch { /* blocked storage */ }
+  store(SESSION_KEY, longTerm ? s : null);
+}
+
+function lockNow() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch { /* blocked storage */ }
+  store(SESSION_KEY, null);
+  app.db = null; app.conn = null; app.key = null;
+  renderUnlock();
+}
+
+function forgetDevice() {
+  for (const k of [VAULT_KEY, SESSION_KEY, LEGACY_CONN_KEY, LEGACY_GH_KEY]) store(k, null);
+  try { sessionStorage.removeItem(SESSION_KEY); } catch { /* blocked storage */ }
+  app.db = null; app.conn = null; app.key = null;
+}
+
+function screen(html) {
   $("#nav").hidden = true;
   $("#status").textContent = "";
-  $("#view").innerHTML = `
-  <section class="connect card">
-    <h1>Connect your radar</h1>
-    <p class="muted">This page has no data of its own. It reads your radar's cloud database directly, using the
-      address and key you enter here. They are saved only in this browser.</p>
+  $("#lock").hidden = true;
+  $("#view").innerHTML = `<section class="connect card">${html}</section>`;
+}
+
+function renderUnlock(error = "") {
+  screen(`
+    <h1>LinkedIn Radar</h1>
+    <p class="muted">Enter your password to open the radar.</p>
     ${error ? `<p class="error">${esc(error)}</p>` : ""}
-    <label>Database address<input id="c-url" placeholder="libsql://linkedin-alerts-….turso.io" autocomplete="off" spellcheck="false"></label>
-    <label>Database key<input id="c-token" type="password" placeholder="The token from Turso" autocomplete="off"></label>
-    <button class="primary" id="c-go">Connect</button>
-    <p class="hint">Fastest way: in Terminal run <code>~/.local/bin/uv run radar app-link</code> and open the link it prints.
-      Or copy the two values from <a href="https://app.turso.tech" rel="noopener noreferrer" target="_blank">app.turso.tech</a>.</p>
-  </section>`;
-  $("#c-go").onclick = async () => {
-    const url = $("#c-url").value.trim(), token = $("#c-token").value.trim();
-    if (!url || !token) { renderConnect("Enter both the address and the key."); return; }
-    await connect({ url, token });
+    <form id="u-form"><label>Password<input id="u-pass" type="password" autocomplete="current-password" required autofocus></label>
+    <label class="check"><input type="checkbox" id="u-keep"> Keep me signed in on this device for 7 days</label>
+    <button class="primary" id="u-go">Unlock</button></form>
+    <p class="hint">Forgot it? <button class="link" id="u-forget">Remove the radar from this device</button> and connect again
+      with the link from <code>~/.local/bin/uv run radar app-link</code>.</p>`);
+  const pass = $("#u-pass");
+  pass.focus();
+  $("#u-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const wait = (app.lockedUntil || 0) - Date.now();
+    if (wait > 0) { renderUnlock(`Too many tries. Wait ${Math.ceil(wait / 1000)} seconds.`); return; }
+    $("#u-go").disabled = true;
+    $("#u-go").textContent = "Unlocking…";
+    let conn;
+    try { conn = await openVault(pass.value); } catch {
+      app.fails = (app.fails || 0) + 1;
+      if (app.fails >= 5) { app.lockedUntil = Date.now() + 30000; app.fails = 0; }
+      renderUnlock("Wrong password.");
+      return;
+    }
+    app.fails = 0;
+    rememberSession(conn, $("#u-keep").checked);
+    await openApp(conn);
+  };
+  $("#u-forget").onclick = () => {
+    if (!confirm("Remove the saved radar connection from this browser?")) return;
+    forgetDevice();
+    renderConnect();
   };
 }
 
-async function connect(conn) {
-  const db = new DB(conn.url, conn.token);
+function renderSetPassword(conn, error = "") {
+  screen(`
+    <h1>Choose a password</h1>
+    <p class="muted">Connected. Pick a password for this device: the radar opens only with it, and your database key is
+      stored encrypted with it. Use at least 10 characters.</p>
+    ${error ? `<p class="error">${esc(error)}</p>` : ""}
+    <form id="p-form"><label>Password<input id="p1" type="password" autocomplete="new-password" minlength="10" required></label>
+    <label>Repeat it<input id="p2" type="password" autocomplete="new-password" minlength="10" required></label>
+    <label class="check"><input type="checkbox" id="p-keep"> Keep me signed in on this device for 7 days</label>
+    <button class="primary" id="p-go">Save and open</button></form>
+    <p class="hint">If you forget it, connect again with the link from <code>radar app-link</code> and choose a new one.</p>`);
+  $("#p1").focus();
+  $("#p-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const a = $("#p1").value, b = $("#p2").value;
+    if (a.length < 10) { renderSetPassword(conn, "Use at least 10 characters."); return; }
+    if (a !== b) { renderSetPassword(conn, "The two passwords don't match."); return; }
+    $("#p-go").disabled = true;
+    $("#p-go").textContent = "Saving…";
+    await lockWithPassword(conn, a);
+    for (const k of [LEGACY_CONN_KEY, LEGACY_GH_KEY]) store(k, null);
+    rememberSession(conn, $("#p-keep").checked);
+    await openApp(conn);
+  };
+}
+
+function renderConnect(error = "") {
+  screen(`
+    <h1>Connect your radar</h1>
+    <p class="muted">This page has no data of its own. It reads your radar's cloud database directly. Connect once on
+      this device, then choose a password.</p>
+    ${error ? `<p class="error">${esc(error)}</p>` : ""}
+    <p class="hint">Easiest: in Terminal run <code>~/.local/bin/uv run radar app-link</code> and open the link it prints.</p>
+    <details><summary>Or enter the two values by hand</summary>
+    <label>Database address<input id="c-url" placeholder="libsql://linkedin-alerts-….turso.io" autocomplete="off" spellcheck="false"></label>
+    <label>Database key<input id="c-token" type="password" placeholder="The token from Turso" autocomplete="off"></label>
+    <button class="primary" id="c-go">Connect</button></details>`);
+  $("#c-go").onclick = async () => {
+    const url = $("#c-url").value.trim(), token = $("#c-token").value.trim();
+    if (!url || !token) { renderConnect("Enter both the address and the key."); return; }
+    await connectNew({ url, token });
+  };
+}
+
+async function checkConn(conn) {
   try {
-    await db.q("SELECT COUNT(*) AS n FROM items");
+    await new DB(conn.url, conn.token).q("SELECT COUNT(*) AS n FROM items");
+    return "";
   } catch (e) {
-    renderConnect(e instanceof AuthError ? "That key was refused. Copy it again from Turso."
-      : /no such table/i.test(e.message) ? "Connected, but this database has no radar data yet."
-      : e.message);
-    return false;
+    return e instanceof AuthError ? "That key was refused. Get a fresh link with radar app-link."
+      : /no such table/i.test(e.message) ? "Connected, but this database has no radar data yet." : e.message;
   }
-  store(CONN_KEY, { url: db.url, token: conn.token });
-  app.db = db;
+}
+
+async function connectNew(conn) {
+  conn = { url: httpUrl(conn.url), token: conn.token, gh: conn.gh || null };
+  const problem = await checkConn(conn);
+  if (problem) { renderConnect(problem); return; }
+  renderSetPassword(conn);
+}
+
+async function openApp(conn) {
+  app.conn = conn;
+  app.db = new DB(conn.url, conn.token);
   $("#nav").hidden = false;
-  await loadBasics();
+  $("#lock").hidden = false;
+  try {
+    await loadBasics();
+  } catch (e) {
+    if (e instanceof AuthError) { forgetDevice(); renderConnect("The database key no longer works. Connect again."); return; }
+    $("#view").innerHTML = `<div class="card error">Couldn't load the radar: ${esc(e.message)}</div>`;
+    return;
+  }
   if (!location.hash.startsWith("#/")) location.hash = "#/feed"; else route();
-  return true;
 }
 
 function readConnectLink() {
@@ -273,13 +425,13 @@ async function route() {
   try {
     await fn(view, rest.map(decodeURIComponent), name);
   } catch (e) {
-    if (e instanceof AuthError) { store(CONN_KEY, null); app.db = null; renderConnect(e.message); return; }
+    if (e instanceof AuthError) { forgetDevice(); renderConnect("The database key no longer works. Connect again."); return; }
     view.innerHTML = `<div class="card error">Couldn't load this page: ${esc(e.message)}</div>`;
   }
 }
 window.addEventListener("hashchange", () => {
   const link = location.hash.startsWith("#connect=") && readConnectLink();
-  if (link) connect(link); else route();
+  if (link) connectNew(link); else route();
 });
 
 // ── shared card for posts, news and saved-search matches ─────────────────────
@@ -943,7 +1095,7 @@ async function renderRuns(view) {
 }
 
 async function runNow(mode = "force-collect") {
-  const gh = store(GH_KEY) || {};
+  const gh = (app.conn && app.conn.gh) || {};
   const repo = gh.repo || app.config.github_repo;
   if (!gh.token || !repo) {
     toast("To start runs from here, add a GitHub key in Settings.", true);
@@ -971,15 +1123,16 @@ async function renderSettings(view) {
   ]);
   const cfg = app.config;
   const p = cfg.profile || {};
-  const gh = store(GH_KEY) || {};
+  const gh = (app.conn && app.conn.gh) || {};
   const sched = cfg.schedule || {};
   view.innerHTML = `
   <h1>Settings</h1>
   <section class="grid2">
     <div class="card"><h2>This browser</h2>
       <p>Connected to <code>${esc(new URL(app.db.url).host)}</code>.</p>
-      <p class="muted small">The database key is saved only in this browser. Sign out on shared computers.</p>
-      <button class="btn danger" id="signout">Sign out on this device</button>
+      <p class="muted small">The database key is saved only in this browser, encrypted with your password.</p>
+      <div class="foot"><button class="btn" id="lock2">Lock now</button>
+        <button class="btn danger" id="signout">Remove from this device</button></div>
       <h2>Start runs from here <span class="muted small">(optional)</span></h2>
       <p class="muted small">Create a GitHub key that can only start runs: on
         <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">this page</a>
@@ -1005,14 +1158,17 @@ async function renderSettings(view) {
   </section>
   <section class="card"><h2>Companies watched</h2>
     <p>${(cfg.companies || []).map((c) => esc(c.name)).join(" · ") || "–"}</p></section>`;
+  $("#lock2").onclick = lockNow;
   $("#signout").onclick = () => {
-    if (!confirm("Remove the database key from this browser?")) return;
-    store(CONN_KEY, null); store(GH_KEY, null); app.db = null; renderConnect();
+    if (!confirm("Remove the radar connection and keys from this browser?")) return;
+    forgetDevice();
+    renderConnect();
   };
-  $("#gh-save").onclick = () => {
+  $("#gh-save").onclick = async () => {
     const token = $("#gh-token").value.trim();
-    store(GH_KEY, { repo: $("#gh-repo").value.trim(), token: token.startsWith("••") ? gh.token : token });
-    toast("Saved in this browser.");
+    const conn = { ...app.conn, gh: { repo: $("#gh-repo").value.trim(), token: token.startsWith("••") ? gh.token : token } };
+    if (await saveConn(conn)) toast("Saved, encrypted with your password.");
+    else toast("Saved for this visit. To keep it, lock the app, unlock with your password and save again.", true);
   };
   $("#track-go").onclick = async () => {
     const v = $("#track-in").value.trim();
@@ -1027,6 +1183,7 @@ async function renderSettings(view) {
 
 // ── start ────────────────────────────────────────────────────────────────────
 
+$("#lock").addEventListener("click", lockNow);
 $("#status").addEventListener("click", async () => {
   if (!app.db) return;
   await loadBasics();
@@ -1035,7 +1192,19 @@ $("#status").addEventListener("click", async () => {
 });
 
 (async function boot() {
-  const conn = readConnectLink() || store(CONN_KEY);
-  if (!conn || !conn.url || !conn.token) { renderConnect(); return; }
-  await connect(conn);
+  if (!window.crypto || !crypto.subtle) {
+    screen(`<h1>LinkedIn Radar</h1><p class="error">This browser can't encrypt data here. Open the app over https.</p>`);
+    return;
+  }
+  const link = readConnectLink();
+  if (link && link.url && link.token) { await connectNew(link); return; }
+  const session = getSession();
+  if (session && store(VAULT_KEY)) { await openApp(session); return; }
+  if (store(VAULT_KEY)) { renderUnlock(); return; }
+  const legacy = store(LEGACY_CONN_KEY);     // connected before passwords existed: choose one now
+  if (legacy && legacy.url && legacy.token) {
+    await connectNew({ ...legacy, gh: store(LEGACY_GH_KEY) || null });
+    return;
+  }
+  renderConnect();
 })();

@@ -42,6 +42,7 @@ code { background: var(--surface-2); border: 1px solid var(--line); border-radiu
 #nav a.on { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .status { font-size: 13px; color: var(--muted); cursor: pointer; white-space: nowrap; }
 .status .dot { font-size: 10px; }
+.lockbtn { padding: 4px 10px; font-size: 13px; border-radius: 999px; }
 .status.ok .dot { color: var(--good); }
 .status.failed .dot { color: var(--bad); }
 .status.running .dot { color: var(--ok); }
